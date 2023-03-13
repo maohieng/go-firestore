@@ -1,4 +1,4 @@
-module github.com/maohieng/go/firestore
+module github.com/maohieng/go-firestore
 
 go 1.18
 
