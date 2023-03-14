@@ -220,11 +220,13 @@ func (f *firestoreRepo) Paginate(ctx context.Context, limit int, startToken stri
 
 func encodedSnapshot(shot *firestore.DocumentSnapshot) string {
 	//TODO serialize it
+	// https://bitbucket.org/cammobteamweb/bluetrace-kh-server/src/master/jomutils/src/main/java/github/jommobile/cloud/datastore/ObjectifyUtils.java
 	return shot.Ref.ID
 }
 
 func (f *firestoreRepo) decodeSnapshot(ctx context.Context, token string) (*firestore.DocumentSnapshot, error) {
 	//TODO deserialize it
+	// https://bitbucket.org/cammobteamweb/bluetrace-kh-server/src/master/jomutils/src/main/java/github/jommobile/cloud/datastore/ObjectifyUtils.java
 	shot, err := f.client.Collection(f.cllName).Doc(token).Get(ctx)
 	if err != nil {
 		return nil, err
