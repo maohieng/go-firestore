@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/maohieng/go-repo"
 	"google.golang.org/api/iterator"
 )
 
@@ -14,7 +13,20 @@ var (
 	ErrNotFound      = errors.New("document cannot be found")
 )
 
-func createDocRef(cr *firestore.CollectionRef, item repo.BaseEntityType) *firestore.DocumentRef {
+type BaseEntity interface {
+	GetId() string
+	SetId(string)
+	TableName() string
+}
+
+type Page struct {
+	Items      []BaseEntity `json:"items"`
+	NextToken  string       `json:"nextToken"`
+	Limit      int          `json:"limit"`
+	TotalCount int          `json:"totalCount"`
+}
+
+func createDocRef(cr *firestore.CollectionRef, item BaseEntity) *firestore.DocumentRef {
 	var doc *firestore.DocumentRef
 	if item.GetId() == "" {
 		doc = cr.NewDoc()
@@ -29,9 +41,7 @@ func createDocRef(cr *firestore.CollectionRef, item repo.BaseEntityType) *firest
 // Create stores a document of type item.
 // item be must a pointer to the concrete data type.
 // It will return an error if document exists
-func Create(ctx context.Context, c *firestore.Client, item repo.BaseEntityType) (string, error) {
-	item.SetActive(true)
-
+func Create(ctx context.Context, c *firestore.Client, item BaseEntity) (string, error) {
 	cll := c.Collection(item.TableName())
 
 	var doc = createDocRef(cll, item)
@@ -46,7 +56,7 @@ func Create(ctx context.Context, c *firestore.Client, item repo.BaseEntityType) 
 
 // Set will create a document or update with [firestore.MergeAll] option.
 // item be must a pointer to the concrete data type.
-func Set(ctx context.Context, c *firestore.Client, item repo.BaseEntityType) (string, error) {
+func Set(ctx context.Context, c *firestore.Client, item BaseEntity) (string, error) {
 	doc := createDocRef(c.Collection(item.TableName()), item)
 	_, err := doc.Set(ctx, item, firestore.MergeAll)
 	if err != nil {
@@ -62,7 +72,7 @@ func Set(ctx context.Context, c *firestore.Client, item repo.BaseEntityType) (st
 // If all items cannot be created, it returns (nil, err) which err joined all the
 // creation errors.
 // If one or more item are created, it returns (ids, err) which err of the rest.
-func BulkCreate(ctx context.Context, c *firestore.Client, items []repo.BaseEntityType) ([]string, error) {
+func BulkCreate(ctx context.Context, c *firestore.Client, ignoreFail bool, items ...BaseEntity) ([]string, error) {
 	bw := c.BulkWriter(ctx)
 
 	var nerr int
@@ -74,6 +84,8 @@ func BulkCreate(ctx context.Context, c *firestore.Client, items []repo.BaseEntit
 		// should join errors
 		if e == nil {
 			ids = append(ids, doc.ID)
+		} else if !ignoreFail {
+			return nil, e
 		} else {
 			nerr++
 			err = errors.Join(err, fmt.Errorf("%s %w", item.GetId(), e))
@@ -142,7 +154,7 @@ type UpdateParams struct {
 // If all items cannot be created, it returns (nil, err) which err joined all the
 // creation errors.
 // If one or more item are created, it returns (ids, err) which err of the rest.
-func BulkUpdate(ctx context.Context, c *firestore.Client, params []UpdateParams) ([]string, error) {
+func BulkUpdate(ctx context.Context, c *firestore.Client, ignoreFail bool, params ...UpdateParams) ([]string, error) {
 	bw := c.BulkWriter(ctx)
 
 	var nerr int
@@ -151,6 +163,10 @@ func BulkUpdate(ctx context.Context, c *firestore.Client, params []UpdateParams)
 	for _, item := range params {
 		cll := c.Collection(item.TableName)
 		if cll == nil {
+			if !ignoreFail {
+				return nil, ErrNoParentFound
+			}
+
 			nerr++
 			err = errors.Join(err, ErrNoParentFound)
 			continue
@@ -162,6 +178,8 @@ func BulkUpdate(ctx context.Context, c *firestore.Client, params []UpdateParams)
 		// should join errors
 		if e == nil {
 			ids = append(ids, doc.ID)
+		} else if !ignoreFail {
+			return nil, e
 		} else {
 			nerr++
 			err = errors.Join(err, fmt.Errorf("%s %w", item.Id, e))
@@ -179,7 +197,7 @@ func BulkUpdate(ctx context.Context, c *firestore.Client, params []UpdateParams)
 
 // GetOne get a document by id.
 // item be must a pointer to the concrete data type.
-func GetOne(ctx context.Context, c *firestore.Client, id string, item repo.BaseEntityType) error {
+func GetOne(ctx context.Context, c *firestore.Client, id string, item BaseEntity) error {
 	shot, err := c.Collection(item.TableName()).Doc(id).Get(ctx)
 	if err != nil {
 		return err
@@ -198,7 +216,7 @@ func GetOne(ctx context.Context, c *firestore.Client, id string, item repo.BaseE
 	return nil
 }
 
-func iterateDocs(it *firestore.DocumentIterator, newItem func() repo.BaseEntityType) (entities []repo.BaseEntityType, lastShot *firestore.DocumentSnapshot, err error) {
+func IterateDocs(it *firestore.DocumentIterator, newItem func() BaseEntity) (entities []BaseEntity, lastShot *firestore.DocumentSnapshot, err error) {
 	defer it.Stop()
 
 	for {
@@ -223,12 +241,33 @@ func iterateDocs(it *firestore.DocumentIterator, newItem func() repo.BaseEntityT
 	return
 }
 
+// Where for [firestore.Query.Where]
+type Where struct {
+	// The path can be a single field or a dot-separated sequence of fields,
+	// and must not contain any of the runes "˜*/[]".
+	Path string
+	// The op argument must be one of "==", "!=", "<", "<=", ">", ">=",
+	// "array-contains", "array-contains-any", "in" or "not-in".
+	Op    string
+	Value any
+}
+
+func Query(c *firestore.Client, collectionPath string, where ...Where) firestore.Query {
+	coll := c.Collection(collectionPath)
+	qry := coll.Query
+	for _, w := range where {
+		qry = qry.Where(w.Path, w.Op, w.Value)
+	}
+
+	return qry
+}
+
 // GetAll gets all document from collection `newItem.TableName()`.
 // newItem func must return a pointer to the concreted data type.
 // This func uses [firestore.GetAll].
-func GetAll(ctx context.Context, c *firestore.Client, newItem func() repo.BaseEntityType) ([]repo.BaseEntityType, error) {
-	it := c.Collection(newItem().TableName()).Documents(ctx)
-	entities, _, err := iterateDocs(it, newItem)
+func GetAll(ctx context.Context, c *firestore.Client, newItem func() BaseEntity, where ...Where) ([]BaseEntity, error) {
+	it := Query(c, newItem().TableName(), where...).Documents(ctx)
+	entities, _, err := IterateDocs(it, newItem)
 	if err != nil {
 		return nil, err
 	}
@@ -236,31 +275,38 @@ func GetAll(ctx context.Context, c *firestore.Client, newItem func() repo.BaseEn
 	return entities, nil
 }
 
-func Paginate(ctx context.Context, c *firestore.Client, limit int, startToken string, newItem func() repo.BaseEntityType) (repo.Page, error) {
-	var qry firestore.Query
-
+func Paginate(ctx context.Context, c *firestore.Client, prevPage Page, newItem func() BaseEntity, where ...Where) (Page, error) {
 	cll := newItem().TableName()
-	// TODO to test
-	if startToken == "" {
-		qry = c.Collection(cll).Limit(limit)
+
+	var qry firestore.Query = Query(c, cll, where...)
+	var newQry firestore.Query
+	if prevPage.NextToken == "" {
+		newQry = qry.Limit(prevPage.Limit)
+		// TODO set count
+		//agg, err := qry.NewAggregationQuery().WithCount("count").Get(ctx)
+		//if err != nil {
+		//	return Page{}, fmt.Errorf("unable to aggregate count: %w", err)
+		//}
+		//log.Println(agg)
+		//prevPage.TotalCount = 0
 	} else {
-		dc, err := decodeSnapshot(ctx, c, cll, startToken)
+		dc, err := decodeSnapshot(ctx, c, cll, prevPage.NextToken)
 		if err != nil {
-			return repo.Page{}, err
+			return Page{}, fmt.Errorf("unable to decode snapshot: %w", err)
 		}
 
-		qry = c.Collection(cll).StartAt(dc).Limit(limit)
+		newQry = qry.StartAt(dc).Limit(prevPage.Limit)
 	}
 
-	all := qry.Documents(ctx)
-	results, lastShot, err := iterateDocs(all, newItem)
+	all := newQry.Documents(ctx)
+	results, lastShot, err := IterateDocs(all, newItem)
 	if err != nil {
-		return repo.Page{}, err
+		return Page{}, fmt.Errorf("error iterate document: %w", err)
 	}
 
 	// check if next is Done
 	var next string
-	it := c.Collection(cll).StartAfter(lastShot).Limit(1).Documents(ctx)
+	it := qry.StartAfter(lastShot).Limit(1).Documents(ctx)
 	for {
 		shot, e := it.Next()
 		if e == iterator.Done {
@@ -270,9 +316,11 @@ func Paginate(ctx context.Context, c *firestore.Client, limit int, startToken st
 		next = encodedSnapshot(shot)
 	}
 
-	return repo.Page{
-		Items:     results,
-		NextToken: next,
+	return Page{
+		Items:      results,
+		NextToken:  next,
+		TotalCount: prevPage.TotalCount,
+		Limit:      prevPage.Limit,
 	}, nil
 }
 
@@ -302,8 +350,8 @@ func Delete(ctx context.Context, c *firestore.Client, tableName, id string) erro
 	return nil
 }
 
-func SoftDelete(ctx context.Context, c *firestore.Client, tableName, id string) error {
-	fv := make(map[string]any)
-	fv[repo.ActiveFieldName] = false
-	return Update(ctx, c, tableName, id, fv)
-}
+//func SoftDelete(ctx context.Context, c *firestore.Client, tableName, id string) error {
+//	fv := make(map[string]any)
+//	fv[ActiveFieldName] = false
+//	return Update(ctx, c, tableName, id, fv)
+//}
